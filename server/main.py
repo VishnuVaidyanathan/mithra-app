@@ -19,6 +19,7 @@ Endpoints:
 """
 from __future__ import annotations
 
+import base64
 import os
 import sys
 import uuid
@@ -105,9 +106,11 @@ GEMMA_MODEL = "gemma-4-26b-a4b-it"   # or "gemma-4-31b-it" for the larger varian
 
 
 class ProcessRequest(BaseModel):
-    text: str
+    text: str = ""
     session_id: str = ""
     api_key: str = ""          # passed from frontend; falls back to env var
+    image_base64: Optional[str] = None   # base64-encoded image (optional)
+    image_mime_type: str = "image/jpeg"  # e.g. image/png, image/webp
 
 
 class ResetRequest(BaseModel):
@@ -170,7 +173,8 @@ async def process(req: ProcessRequest):
     session = get_session(session_id, api_key)
 
     # --- Run RCC pipeline -------------------------------------------------
-    rcc_output = session.rcc.process(req.text)
+    rcc_text = req.text or "[shared a photo]"
+    rcc_output = session.rcc.process(rcc_text)
     m  = rcc_output.metrics
 
     metrics = {
@@ -219,9 +223,19 @@ async def process(req: ProcessRequest):
                 )
                 for m in session.history
             ]
-            contents.append(
-                types.Content(role="user", parts=[types.Part(text=req.text)])
-            )
+            # Build current user parts (image first, then text)
+            user_parts = []
+            if req.image_base64:
+                user_parts.append(
+                    types.Part(
+                        inline_data=types.Blob(
+                            data=base64.b64decode(req.image_base64),
+                            mime_type=req.image_mime_type,
+                        )
+                    )
+                )
+            user_parts.append(types.Part(text=rcc_text))
+            contents.append(types.Content(role="user", parts=user_parts))
 
             response = client.models.generate_content(
                 model=GEMMA_MODEL,
@@ -233,8 +247,8 @@ async def process(req: ProcessRequest):
             )
             reply = response.text
 
-            # Store history
-            session.history.append({"role": "user",      "content": req.text})
+            # Store history (text only — don't persist base64 blobs)
+            session.history.append({"role": "user",      "content": rcc_text})
             session.history.append({"role": "assistant", "content": reply})
             session.trim_history()
 
