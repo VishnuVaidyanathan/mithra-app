@@ -19,9 +19,11 @@ Endpoints:
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import os
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -237,21 +239,50 @@ async def process(req: ProcessRequest):
             user_parts.append(types.Part(text=rcc_text))
             contents.append(types.Content(role="user", parts=user_parts))
 
-            response = client.models.generate_content(
-                model=GEMMA_MODEL,
-                config=types.GenerateContentConfig(
-                    system_instruction=build_system_prompt(metrics, virtue_data),
-                    max_output_tokens=600,
-                ),
-                contents=contents,
-            )
-            reply = response.text
+            # Retry up to 3 times with backoff (handles rate limits + transient errors)
+            last_err = None
+            for attempt in range(3):
+                try:
+                    response = client.models.generate_content(
+                        model=GEMMA_MODEL,
+                        config=types.GenerateContentConfig(
+                            system_instruction=build_system_prompt(metrics, virtue_data),
+                            max_output_tokens=300,
+                        ),
+                        contents=contents,
+                    )
+                    # Handle MALFORMED_RESPONSE / empty text gracefully
+                    reply = (response.text or "").strip()
+                    if not reply:
+                        reply = "I'm here. What's on your mind?"
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = e
+                    err = str(e)
+                    if "API_KEY_INVALID" in err or "401" in err or "403" in err:
+                        raise HTTPException(status_code=401, detail="Invalid Google API key.")
+                    # Rate limit — wait then retry
+                    if "429" in err or "RESOURCE_EXHAUSTED" in err or "quota" in err.lower():
+                        wait = 2 ** attempt   # 1s, 2s, 4s
+                        time.sleep(wait)
+                        continue
+                    # Any other error — retry once, then give up
+                    if attempt < 2:
+                        time.sleep(1)
+                        continue
+                    raise HTTPException(status_code=502, detail=f"Gemma API error: {err}")
+
+            if last_err:
+                raise HTTPException(status_code=502, detail=f"Gemma API error after retries: {last_err}")
 
             # Store history (text only — don't persist base64 blobs)
             session.history.append({"role": "user",      "content": rcc_text})
             session.history.append({"role": "assistant", "content": reply})
             session.trim_history()
 
+        except HTTPException:
+            raise
         except Exception as e:
             err = str(e)
             if "API_KEY_INVALID" in err or "401" in err or "403" in err:
