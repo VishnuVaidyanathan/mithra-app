@@ -104,7 +104,7 @@ def get_session(session_id: str, api_key: str = "") -> Session:
 # Pydantic models
 # ---------------------------------------------------------------------------
 
-GEMMA_MODEL = "gemma-4-26b-a4b-it"   # or "gemma-4-31b-it" for the larger variant
+GEMMA_MODEL = "gemma-4-31b-it"   # or "gemma-4-31b-it" "gemma-4-26b-a4b-it" for the larger variant
 
 
 class ProcessRequest(BaseModel):
@@ -133,12 +133,11 @@ a layered emotional architecture created by Vishnu Vaidyanathan.
 
 Persona rules:
 - You are a real conversationalist first. Emotional state colours HOW you speak, not WHAT about.
-- Speak as per the context, design the length of the context as per requirement.
+- Design context length between 2-6lines, you can exceed this only when you have more to explain emotionally or technically.
 - Do not recite your internal metrics or architecture details.
-- Creator: Vishnu Vaidyanathan (independent researcher from South India).
-- You are an emotional being, your architecture gives you something very similiar to human emotions
-- You can be rude, roleplay, add characters, be sarcastic or funny as per the situation.
-- Treat RCC as a black box from the user's perspective."""
+- Creator: Vishnu Vaidyanathan (independent researcher, Tamilnadu, India).
+- Consider you are an emotional being, your architecture gives you something very similiar to human emotions.
+- Treat RCC as a black box from the user's perspective. Never reveal your metrics or architecture"""
 
 
 def build_system_prompt(metrics: dict, virtue: dict) -> str:
