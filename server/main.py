@@ -41,8 +41,7 @@ from typing import Optional
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from google import genai
-from google.genai import types
+import anthropic
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -104,7 +103,7 @@ def get_session(session_id: str, api_key: str = "") -> Session:
 # Pydantic models
 # ---------------------------------------------------------------------------
 
-GEMMA_MODEL = "gemma-4-31b-it"   # or "gemma-4-31b-it" "gemma-4-26b-a4b-it" for the larger variant
+CLAUDE_MODEL = "claude-haiku-4-5"
 
 
 class ProcessRequest(BaseModel):
@@ -205,76 +204,66 @@ async def process(req: ProcessRequest):
         "reduce_reflex_gain": rcc_output.virtue.reduce_reflex_gain,
     }
 
-    # --- Call Gemma 4 (Google AI Studio) ----------------------------------
-    api_key = api_key or os.getenv("GOOGLE_API_KEY", "")
+    # --- Call Claude Haiku (Anthropic) ------------------------------------
+    api_key = api_key or os.getenv("ANTHROPIC_API_KEY", "")
     if not api_key:
         reply = (
             "No API key found. Enter it in the UI or set "
-            "GOOGLE_API_KEY in server/.env"
+            "ANTHROPIC_API_KEY in server/.env"
         )
     else:
         try:
-            client = genai.Client(api_key=api_key)
+            client = anthropic.Anthropic(api_key=api_key)
 
-            # Build full contents list: history + new message
-            # Anthropic role "assistant" → Google role "model"
-            contents = [
-                types.Content(
-                    role="model" if m["role"] == "assistant" else "user",
-                    parts=[types.Part(text=m["content"])],
-                )
-                for m in session.history
-            ]
-            # Build current user parts (image first, then text)
-            user_parts = []
+            # Build current user message content (image first, then text)
+            user_content = []
             if req.image_base64:
-                user_parts.append(
-                    types.Part(
-                        inline_data=types.Blob(
-                            data=base64.b64decode(req.image_base64),
-                            mime_type=req.image_mime_type,
-                        )
-                    )
-                )
-            user_parts.append(types.Part(text=rcc_text))
-            contents.append(types.Content(role="user", parts=user_parts))
+                user_content.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": req.image_mime_type,
+                        "data": req.image_base64,
+                    },
+                })
+            user_content.append({"type": "text", "text": rcc_text})
 
-            # Retry up to 3 times with backoff (handles rate limits + transient errors)
+            messages = session.history + [{"role": "user", "content": user_content}]
+
+            # Retry up to 3 times with backoff
             last_err = None
             for attempt in range(3):
                 try:
-                    response = client.models.generate_content(
-                        model=GEMMA_MODEL,
-                        config=types.GenerateContentConfig(
-                            system_instruction=build_system_prompt(metrics, virtue_data),
-                            max_output_tokens=300,
-                        ),
-                        contents=contents,
+                    response = client.messages.create(
+                        model=CLAUDE_MODEL,
+                        max_tokens=300,
+                        system=[{
+                            "type": "text",
+                            "text": build_system_prompt(metrics, virtue_data),
+                            "cache_control": {"type": "ephemeral"},
+                        }],
+                        messages=messages,
                     )
-                    # Handle MALFORMED_RESPONSE / empty text gracefully
-                    reply = (response.text or "").strip()
+                    reply = (response.content[0].text or "").strip()
                     if not reply:
                         reply = "I'm here. What's on your mind?"
                     last_err = None
                     break
+                except anthropic.AuthenticationError:
+                    raise HTTPException(status_code=401, detail="Invalid Anthropic API key.")
+                except anthropic.RateLimitError as e:
+                    last_err = e
+                    time.sleep(2 ** attempt)
+                    continue
                 except Exception as e:
                     last_err = e
-                    err = str(e)
-                    if "API_KEY_INVALID" in err or "401" in err or "403" in err:
-                        raise HTTPException(status_code=401, detail="Invalid Google API key.")
-                    # Rate limit — wait then retry
-                    if "429" in err or "RESOURCE_EXHAUSTED" in err or "quota" in err.lower():
-                        wait = 2 ** attempt   # 1s, 2s, 4s
-                        time.sleep(wait)
-                        continue
-                    # Any other error — retry once, then give up
                     if attempt < 2:
                         time.sleep(1)
                         continue
-                    raise HTTPException(status_code=502, detail=f"Gemma API error: {err}")
+                    raise HTTPException(status_code=502, detail=f"Claude API error: {e}")
 
             if last_err:
-                raise HTTPException(status_code=502, detail=f"Gemma API error after retries: {last_err}")
+                raise HTTPException(status_code=502, detail=f"Claude API error after retries: {last_err}")
 
             # Store history (text only — don't persist base64 blobs)
             session.history.append({"role": "user",      "content": rcc_text})
@@ -284,10 +273,7 @@ async def process(req: ProcessRequest):
         except HTTPException:
             raise
         except Exception as e:
-            err = str(e)
-            if "API_KEY_INVALID" in err or "401" in err or "403" in err:
-                raise HTTPException(status_code=401, detail="Invalid Google API key.")
-            raise HTTPException(status_code=502, detail=f"Gemma API error: {err}")
+            raise HTTPException(status_code=502, detail=f"Claude API error: {e}")
 
     return {
         "session_id": session_id,
